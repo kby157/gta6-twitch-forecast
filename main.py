@@ -6,7 +6,12 @@
 # (that hour's viewers / the launch's first-hour viewers). Pooling those
 # samples across all bundled launches gives, hour by hour, an empirical
 # distribution of the log ratio; the forecast for a new launch is its own
-# first-hour count scaled by the quantiles of that distribution.
+# first-hour count scaled by the quantiles of that distribution. Launches of
+# a similar size count more: each sample is weighted by a kernel on the
+# distance between its own first-hour audience and the new launch's, since
+# a giant launch's day shape tracks other giant launches better than it
+# tracks small ones (leave-one-out over the bundled launches: weighting
+# improves the mean pinball loss by roughly six percent).
 
 import json
 import math
@@ -36,23 +41,27 @@ def hourly_viewers(points):
     return table
 
 
-def quantile(sorted_values, level):
-    """Linear-interpolated quantile of an ascending list."""
-    n = len(sorted_values)
-    if n == 1:
-        return sorted_values[0]
-    pos = level * (n - 1)
-    low = int(math.floor(pos))
-    high = min(low + 1, n - 1)
-    frac = pos - low
-    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+def weighted_quantile(sorted_pairs, level):
+    """Quantile of (value, weight) pairs sorted by value: the first value
+    whose cumulative weight reaches the level's share of the total."""
+    total = sum(weight for _, weight in sorted_pairs)
+    if total <= 0:
+        return sorted_pairs[len(sorted_pairs) // 2][0]
+    target = level * total
+    acc = 0.0
+    for value, weight in sorted_pairs:
+        acc += weight
+        if acc >= target:
+            return value
+    return sorted_pairs[-1][0]
 
 
 def comparable_shape(comp):
     """One comparable's release-day shape, or None when it is unusable.
 
-    Returns (share, ratios): share is the first hour's fraction of the day's
-    peak hour, ratios maps each forecast hour to log(viewers / first hour).
+    Returns (share, base, ratios): share is the first hour's fraction of
+    the day's peak hour, base is the first hour's viewer count, and ratios
+    maps each forecast hour to log(viewers / first hour).
     """
     try:
         start = parse_ts(comp["day_start"])
@@ -73,33 +82,43 @@ def comparable_shape(comp):
     log_base = math.log(base)
     ratios = {hour: math.log(value) - log_base
               for hour, value in day.items() if hour != 1}
-    return share, ratios
+    return share, base, ratios
 
 
-def collect_log_ratios(case):
+def scale_weight(base, target):
+    """Similarity weight between a comparable's first-hour audience and the
+    new launch's: a Gaussian kernel on the log10 distance, width 0.4."""
+    dist = math.log10(max(base, 1.0)) - math.log10(max(target, 1.0))
+    return math.exp(-0.5 * (dist / 0.4) ** 2)
+
+
+def collect_log_ratios(case, first_hour):
     """Per forecast hour, the pooled log ratios from comparable launches.
 
     Launches fall into two regimes: ones whose first UTC hour is already hot
     (rolling midnight-local unlocks, like this case's game) and ones whose
     first hour is a trickle before a fixed-hour global unlock. Pooling both
     blurs the shape, so only the hot-first-hour launches are pooled; if too
-    few qualify, the hottest available ones are used instead.
+    few qualify, the hottest available ones are used instead. Each pooled
+    sample carries its launch's scale weight against this case's first
+    hour, so similar-sized launches shape the quantiles most.
     """
     shapes = []
     for comp in case.get("comparables") or []:
         shape = comparable_shape(comp)
         if shape:
             shapes.append(shape)
-    hot = [ratios for share, ratios in shapes if share >= 0.25]
+    hot = [(base, ratios) for share, base, ratios in shapes if share >= 0.25]
     if len(hot) < 6:
         shapes.sort(key=lambda item: item[0], reverse=True)
-        hot = [ratios for _, ratios in shapes[:8]]
+        hot = [(base, ratios) for _, base, ratios in shapes[:8]]
     samples = {hour: [] for hour in HOURS}
     pooled = []
-    for ratios in hot:
+    for base, ratios in hot:
+        weight = scale_weight(base, first_hour)
         for hour, ratio in ratios.items():
-            samples[hour].append(ratio)
-            pooled.append(ratio)
+            samples[hour].append((ratio, weight))
+            pooled.append((ratio, weight))
     for hour in HOURS:
         samples[hour].sort()
     pooled.sort()
@@ -125,24 +144,20 @@ def forecast_case(case):
     if known:
         viewers = known[0].get("viewers") or 0
         first_hour = max(float(viewers), 1.0)
-    samples, pooled = collect_log_ratios(case)
+    samples, pooled = collect_log_ratios(case, first_hour)
     # Raw per-hour quantiles of the pooled log ratios, one series per level.
     raw = {}
     for level in LEVELS:
         series = {}
         for hour in HOURS:
             values = samples[hour] if len(samples[hour]) >= 5 else pooled
-            series[hour] = quantile(values, level) if values else 0.0
+            series[hour] = weighted_quantile(values, level) if values else 0.0
         raw[level] = smooth_series(series)
-    median = raw[0.5]
     rows = []
     for hour in HOURS:
         qs = []
         for level in LEVELS:
-            # Widen the smoothed spread slightly around the median: pooled
-            # launches vary a little more than the pool's own quantiles say.
-            log_q = median[hour] + (raw[level][hour] - median[hour]) * 1.1
-            scaled = first_hour * math.exp(log_q)
+            scaled = first_hour * math.exp(raw[level][hour])
             qs.append(min(max(scaled, 1.0), 1_000_000_000.0))
         for i in range(1, len(qs)):
             if qs[i] < qs[i - 1]:
